@@ -1,0 +1,2 @@
+# -
+Preparing for the competition

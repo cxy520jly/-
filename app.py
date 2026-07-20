@@ -2,6 +2,14 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 import streamlit as st
+import streamlit.components.v1 as components
+
+from graph_viz import (
+    build_full_graph,
+    build_disease_subgraph,
+    render_graph_html,
+    render_comparison_graph,
+)
 
 
 st.set_page_config(
@@ -1645,6 +1653,205 @@ def diagnose(
 validate_knowledge_base()
 
 
+
+# =============================================================================
+# 7.1 页面状态与知识图谱局部刷新
+# =============================================================================
+# Streamlit 中，radio、selectbox、checkbox 等控件发生变化时，
+# 都会重新执行当前 Python 脚本。
+#
+# 因此诊断结果不能只保存在普通变量中，
+# 必须保存进 st.session_state，否则切换知识图谱模式后结果会丢失。
+
+if "diagnosis_ready" not in st.session_state:
+    st.session_state.diagnosis_ready = False
+
+if "diagnosis_positive" not in st.session_state:
+    st.session_state.diagnosis_positive = set()
+
+if "diagnosis_negative" not in st.session_state:
+    st.session_state.diagnosis_negative = set()
+
+if "diagnosis_alerts" not in st.session_state:
+    st.session_state.diagnosis_alerts = []
+
+if "diagnosis_results" not in st.session_state:
+    st.session_state.diagnosis_results = []
+
+
+# 新版 Streamlit 使用 st.fragment，
+# 点击知识图谱内部控件时只重新运行知识图谱区域。
+#
+# 旧版本 Streamlit 如果没有 st.fragment，
+# 会自动退化为普通函数，不会因此报错。
+_fragment = getattr(
+    st,
+    "fragment",
+    lambda function: function,
+)
+
+
+@_fragment
+def render_knowledge_graph_panel(
+    results: List[DiagnosisResult],
+) -> None:
+    """独立渲染知识图谱区域。"""
+
+    st.divider()
+    st.subheader("🧠 知识图谱")
+
+    graph_mode = st.radio(
+        "图谱模式",
+        [
+            "完整知识图谱",
+            "Top1疾病证据网络",
+            "鉴别对比图",
+        ],
+        horizontal=True,
+        key="graph_mode",
+    )
+
+    # -------------------------------------------------------------------------
+    # 模式一：完整知识图谱
+    # -------------------------------------------------------------------------
+    if graph_mode == "完整知识图谱":
+        col1, col2 = st.columns([1, 3])
+
+        with col1:
+            disease_names = list(
+                KNOWLEDGE_BASE.keys()
+            )
+
+            selected_disease = st.selectbox(
+                "🔍 跳转到疾病",
+                [
+                    "（全部疾病）",
+                    *disease_names,
+                ],
+                key="kb_select_disease",
+            )
+
+        with col2:
+            st.caption(
+                "🟢 核心证据　"
+                "🟩 支持证据　"
+                "🟥 反向证据　"
+                "粗线表示核心关系，"
+                "细线表示一般支持，"
+                "虚线表示反向关系。"
+            )
+
+            if selected_disease == "（全部疾病）":
+                graph = build_full_graph(
+                    KNOWLEDGE_BASE
+                )
+
+            else:
+                graph = build_disease_subgraph(
+                    KNOWLEDGE_BASE,
+                    selected_disease,
+                )
+
+            if graph is None:
+                st.warning(
+                    "没有找到对应的疾病图谱。"
+                )
+                return
+
+            graph_html = render_graph_html(
+                graph,
+                height="580px",
+                width="100%",
+            )
+
+            components.html(
+                graph_html,
+                height=600,
+                scrolling=False,
+            )
+
+    # -------------------------------------------------------------------------
+    # 模式二：Top1疾病证据网络
+    # -------------------------------------------------------------------------
+    elif graph_mode == "Top1疾病证据网络":
+        if not results:
+            st.info(
+                "当前没有可用于展示的诊断结果。"
+            )
+            return
+
+        top1 = results[0]
+
+        graph = build_disease_subgraph(
+            KNOWLEDGE_BASE,
+            top1.disease,
+        )
+
+        if graph is None:
+            st.warning(
+                f"没有找到“{top1.disease}”的知识图谱。"
+            )
+            return
+
+        st.caption(
+            f"排名第1：**{top1.disease}**　"
+            f"{top1.match_level}　"
+            f"{top1.score:.1f} 分"
+        )
+
+        graph_html = render_graph_html(
+            graph,
+            height="550px",
+            width="100%",
+        )
+
+        components.html(
+            graph_html,
+            height=570,
+            scrolling=False,
+        )
+
+    # -------------------------------------------------------------------------
+    # 模式三：鉴别诊断对比图
+    # -------------------------------------------------------------------------
+    else:
+        if len(results) < 2:
+            st.info(
+                "需要至少两个鉴别诊断结果才能进行对比。"
+            )
+            return
+
+        disease1 = results[0].disease
+        disease2 = results[1].disease
+
+        graph_html = render_comparison_graph(
+            KNOWLEDGE_BASE,
+            disease1,
+            disease2,
+            height="580px",
+            width="100%",
+        )
+
+        st.caption(
+            f"对比：**{disease1}**　vs　"
+            f"**{disease2}**　"
+            "（🟣 紫色表示两种疾病的共享证据）"
+        )
+
+        if graph_html is None:
+            st.warning(
+                "无法生成鉴别诊断对比图。"
+            )
+            return
+
+        components.html(
+            graph_html,
+            height=600,
+            scrolling=False,
+        )
+
+
+
 # =============================================================================
 # 8. 医生录入界面
 # =============================================================================
@@ -1723,44 +1930,79 @@ with st.sidebar:
 
 
 # =============================================================================
-# 9. 结果展示
+# 9. 结果计算与持久化
 # =============================================================================
 if diagnose_btn:
-    positive = set(
+    submitted_positive = set(
         positive_list
     )
 
-    negative = set(
+    submitted_negative = set(
         negative_list
     )
 
     overlap = (
-        positive
-        & negative
+        submitted_positive
+        & submitted_negative
     )
 
     if overlap:
+        # 本次录入无效，不展示旧结果
+        st.session_state.diagnosis_ready = False
+
         st.error(
             "以下项目同时被选为阳性和阴性："
             f"{'、'.join(sorted(overlap))}"
         )
-        st.stop()
 
-    if (
-        not positive
-        and not negative
+    elif (
+        not submitted_positive
+        and not submitted_negative
     ):
+        # 本次没有录入任何证据
+        st.session_state.diagnosis_ready = False
+
         st.warning(
             "请至少录入一项阳性或明确阴性证据。"
         )
-        st.stop()
 
-    alerts, results = diagnose(
-        positive,
-        negative,
-        int(age),
-        sex,
-    )
+    else:
+        submitted_alerts, submitted_results = diagnose(
+            submitted_positive,
+            submitted_negative,
+            int(age),
+            sex,
+        )
+
+        # 将诊断输入和诊断结果永久保存到当前会话
+        st.session_state.diagnosis_positive = (
+            submitted_positive
+        )
+
+        st.session_state.diagnosis_negative = (
+            submitted_negative
+        )
+
+        st.session_state.diagnosis_alerts = (
+            submitted_alerts
+        )
+
+        st.session_state.diagnosis_results = (
+            submitted_results
+        )
+
+        st.session_state.diagnosis_ready = True
+
+
+# =============================================================================
+# 10. 结果展示
+# =============================================================================
+if st.session_state.diagnosis_ready:
+    # 每次页面重新执行时，都从 session_state 读取上一次诊断结果
+    positive = st.session_state.diagnosis_positive
+    negative = st.session_state.diagnosis_negative
+    alerts = st.session_state.diagnosis_alerts
+    results = st.session_state.diagnosis_results
 
     col1, col2, col3, col4 = st.columns(4)
 
@@ -2062,72 +2304,15 @@ if diagnose_btn:
                 st.caption("无")
 
     # =====================================================================
-    # 知识图谱展示（仅在用户勾选侧边栏复选框后渲染）
+    # 知识图谱展示
     # =====================================================================
-    if st.session_state.get("show_knowledge_graph"):
-        st.divider()
-        st.subheader("🧠 知识图谱")
-
-        graph_mode = st.radio(
-            "图谱模式",
-            ["完整知识图谱", "Top1疾病证据网络", "鉴别对比图"],
-            horizontal=True,
-            key="graph_mode",
+    if st.session_state.get(
+            "show_knowledge_graph",
+            False,
+    ):
+        render_knowledge_graph_panel(
+            results
         )
-
-        # 延迟导入，仅在需要渲染图谱时加载
-        from graph_viz import (
-            build_full_graph,
-            build_disease_subgraph,
-            render_graph_html,
-            render_comparison_graph,
-        )
-
-        if graph_mode == "完整知识图谱":
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                disease_names = list(KNOWLEDGE_BASE.keys())
-                selected_disease = st.selectbox(
-                    "🔍 跳转到疾病",
-                    ["（全部疾病）"] + disease_names,
-                    key="kb_select_disease",
-                )
-            with col2:
-                st.caption(
-                    "🟢 核心证据　🟩 支持证据　🟥 反对证据　"
-                    "━ 粗实线 core　─ 细实线 supportive　╌ 虚线 opposing"
-                )
-                if selected_disease != "（全部疾病）":
-                    G = build_disease_subgraph(KNOWLEDGE_BASE, selected_disease)
-                else:
-                    G = build_full_graph(KNOWLEDGE_BASE)
-                html = render_graph_html(G, height="580px", width="100%")
-                st.components.v1.html(html, height=600, scrolling=True)
-
-        elif graph_mode == "Top1疾病证据网络":
-            top1 = results[0]
-            G = build_disease_subgraph(KNOWLEDGE_BASE, top1.disease)
-            st.caption(
-                f"排名第1：**{top1.disease}**　"
-                f"{top1.match_level}　{top1.score:.1f} 分"
-            )
-            html = render_graph_html(G, height="550px", width="100%")
-            st.components.v1.html(html, height=570, scrolling=True)
-
-        else:  # 鉴别对比图
-            if len(results) >= 2:
-                d1 = results[0].disease
-                d2 = results[1].disease
-                html = render_comparison_graph(
-                    KNOWLEDGE_BASE, d1, d2, height="580px", width="100%"
-                )
-                st.caption(
-                    f"对比：**{d1}**　vs　**{d2}**　"
-                    f"（🟣 紫色 = 共享证据，两病均有）"
-                )
-                st.components.v1.html(html, height=600, scrolling=True)
-            else:
-                st.info("需要至少两个鉴别诊断结果才能进行对比。")
 
 else:
     st.info(
